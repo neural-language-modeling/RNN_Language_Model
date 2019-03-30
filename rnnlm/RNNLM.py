@@ -37,8 +37,15 @@ class RNNLM(object):
 
         # We set a dynamic learning rate, it decays every time the model has gone through 150 batches.
         # A minimum learning rate has also been set.
-        self.learning_rate = tf.train.exponential_decay(initial_learning_rate, self.global_step,
-                                                        150, 0.96, staircase=True)
+        self.learning_rate = tf.train.exponential_decay(
+            initial_learning_rate,
+            self.global_step,
+            decay_steps=150,
+            decay_rate=0.96,
+            staircase=True,
+        )
+
+        # Make LR no smaller than final_learning_rate.
         self.learning_rate = tf.cond(tf.less(self.learning_rate, final_learning_rate),
                                      lambda: tf.constant(final_learning_rate),
                                      lambda: self.learning_rate)
@@ -61,6 +68,8 @@ class RNNLM(object):
             input_seq = tf.string_to_number(line_split.values[:-1], out_type=tf.int32)
             # output is 1 2 3 <eos>
             output_seq = tf.string_to_number(line_split.values[1:], out_type=tf.int32)
+            # The shapes of input_seq and output_seq are the same.
+            # Both are [None].
             return input_seq, output_seq
 
         # The map(parse) actually create both input and output from the text lines.
@@ -70,9 +79,13 @@ class RNNLM(object):
         # padded_batch() first pad each element and then batch them.
         # The padding is done according to padded_shapes, which should match the shape of the element.
         # Using None in dimension means padding to the max length of that dimension.
+
+        # Don't shuffle validation dataset.
         validation_dataset = tf.data.TextLineDataset(self.filename_validation).map(parse).padded_batch(
             self.batch_size, padded_shapes=([None], [None]))
 
+        # Note the batch(): each sentence become a batch.
+        # Isn't it no batching at all?
         test_dataset = tf.data.TextLineDataset(self.filename_test).map(parse).batch(1)
 
         iterator = tf.data.Iterator.from_structure(training_dataset.output_types,
@@ -125,7 +138,36 @@ class RNNLM(object):
 
         real_length_in_batch = get_length(non_zero_weights)
 
+        # ================================================
+        # Understanding How Predicting the Next Word Works
+        # ================================================
+        # Since the input and output are basically the same sequence, one maybe confused by
+        # this setting, thinking that the RNN is cheating, knowing the answer before computing.
+        #
+        # No, the answer is in fact, RNN
+        # is *predicting the next word* given the current word and its hidden state.
+        # For each time step, w_i is feed as input, and the RNN combine its hidden state h_i and w_i
+        # to output the next state h_{i+1} and w^{\hat}_{i+1}, which is an observation of the true next word
+        # w_{i+1}. This observation, denoted as w_o for short, is compared against the ground truth next word
+        # and SGD is applied to tune the parameters. This finish one prediction. On the next prediction, the
+        # word previously being the ground truth now becomes input.
+        # Whenever the RNN is doing a prediction, it really don't know the answer, although the answer will be
+        # immediately feed as the next input.
+        #
+        # =====================
+        # A Sample Illustration
+        # =====================
+        # We have a sentence "a b c d".
+        # After padding it becomes: "<sos> a b c d <eos>".
+        # A diagram showing what an RNN see as input and the corresponding output is:
+        #
+        # a b c d      ground truth
+        #   b c d e    input
+        # This is the trickiest part in understanding how RNNLM works, in my opinion.
+
         # The shape of outputs is [batch_size, max_length, num_hidden_units]
+        # The shape of inputs is [B, M, H].
+        # So the dynamic_rnn turns a sequence into another sequence.
         outputs, _ = tf.nn.dynamic_rnn(
             cell=self.cell,
             inputs=self.input_embedded,
@@ -133,6 +175,9 @@ class RNNLM(object):
             dtype=tf.float32
         )
 
+        # Turn a sequence of vectors into a sequence of logits.
+        # By mapping the vector of shape [H] to logits of shape [V] using
+        # weight matrix of shape [H, V] and a bias vector of shape [V].
         def output_embedding(current_output):
             return tf.add(tf.matmul(
                 current_output,
@@ -176,11 +221,13 @@ class RNNLM(object):
         epoch = 0
 
         while epoch < self.num_epochs:
+            # Init the training iterator.
             sess.run(self.training_init_op, {self.filename_train: "./data/train.ids"})
             train_loss = 0.0
             train_valid_words = 0
-            while True:
 
+            # Iterate over the dataset.
+            while True:
                 try:
                     _loss, _valid_words, global_step, current_learning_rate, _ = sess.run(
                         [self.loss, self.valid_words, self.global_step, self.learning_rate, self.updates],
@@ -193,14 +240,12 @@ class RNNLM(object):
                         train_ppl = math.exp(train_loss)
                         print("Training Step: {}, LR: {}".format(global_step, current_learning_rate))
                         print("    Training PPL: {}".format(train_ppl))
-
                         train_loss = 0.0
                         train_valid_words = 0
-
                 except tf.errors.OutOfRangeError:
-                    # The end of one epoch
-                    break
+                    break  # The end of one epoch
 
+            # Run validation after one epoch.
             sess.run(self.validation_init_op, {self.filename_validation: "./data/valid.ids"})
             dev_loss = 0.0
             dev_valid_words = 0
@@ -208,44 +253,52 @@ class RNNLM(object):
                 try:
                     _dev_loss, _dev_valid_words = sess.run(
                         [self.loss, self.valid_words],
+                        # Remember: no dropout in testing or validation.
                         {self.dropout_rate: 1.0})
 
                     dev_loss += np.sum(_dev_loss)
                     dev_valid_words += _dev_valid_words
-
                 except tf.errors.OutOfRangeError:
                     dev_loss /= dev_valid_words
                     dev_ppl = math.exp(dev_loss)
                     print("Validation PPL: {}".format(dev_ppl))
+
+                    # If the dev_ppl don't get any better after 5 epoch, the training
+                    # ends in advance.
                     if dev_ppl < best_score:
                         patience = 5
                         saver.save(sess, "model/best_model.ckpt")
                         best_score = dev_ppl
                     else:
                         patience -= 1
-
                     if patience == 0:
                         epoch = self.num_epochs
-
                     break
 
     def predict(self, sess, input_file, raw_file, verbose=False):
+        """
+
+        :param sess:
+        :param input_file: gap filling exercise ids file.
+        :param raw_file: gap filling exercise file.
+        :param verbose:
+        :return:
+        """
         # if verbose is true, then we print the ppl of every sequence
 
         sess.run(self.test_init_op, {self.filename_test: input_file})
 
         with open(raw_file) as fp:
-
             global_dev_loss = 0.0
             global_dev_valid_words = 0
 
             for raw_line in fp.readlines():
-
                 raw_line = raw_line.strip()
-
+                # Note the update ops is still built, but not run!
                 _dev_loss, _dev_valid_words, input_line = sess.run(
                     [self.loss, self.valid_words, self.input_batch],
-                    {self.dropout_rate: 1.0})
+                    {self.dropout_rate: 1.0}
+                )
 
                 dev_loss = np.sum(_dev_loss)
                 dev_valid_words = _dev_valid_words
