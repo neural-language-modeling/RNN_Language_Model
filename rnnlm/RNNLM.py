@@ -2,6 +2,11 @@ import tensorflow as tf
 import numpy as np
 import math
 
+__all__ = [
+    'RNNLM'
+]
+
+
 class RNNLM(object):
     def __init__(self,
                  vocab_size,
@@ -29,11 +34,12 @@ class RNNLM(object):
 
         self.global_step = tf.Variable(0, trainable=False)
 
-        # We set a dynamic learining rate, it decays every time the model has gone through 150 batches.
+        # We set a dynamic learning rate, it decays every time the model has gone through 150 batches.
         # A minimum learning rate has also been set.
         self.learning_rate = tf.train.exponential_decay(initial_learning_rate, self.global_step,
-                                           150, 0.96, staircase=True)
-        self.learning_rate = tf.cond(tf.less(self.learning_rate, final_learning_rate), lambda: tf.constant(final_learning_rate),
+                                                        150, 0.96, staircase=True)
+        self.learning_rate = tf.cond(tf.less(self.learning_rate, final_learning_rate),
+                                     lambda: tf.constant(final_learning_rate),
                                      lambda: self.learning_rate)
 
         self.dropout_rate = tf.placeholder(tf.float32, name="dropout_rate")
@@ -48,19 +54,22 @@ class RNNLM(object):
             output_seq = tf.string_to_number(line_split.values[1:], out_type=tf.int32)
             return input_seq, output_seq
 
-        training_dataset = tf.data.TextLineDataset(self.file_name_train).map(parse).shuffle(256).padded_batch(self.batch_size, padded_shapes=([None], [None]))
-        validation_dataset = tf.data.TextLineDataset(self.file_name_validation).map(parse).padded_batch(self.batch_size, padded_shapes=([None], [None]))
+        training_dataset = tf.data.TextLineDataset(self.file_name_train).map(parse).shuffle(256).padded_batch(
+            self.batch_size, padded_shapes=([None], [None]))
+        validation_dataset = tf.data.TextLineDataset(self.file_name_validation).map(parse).padded_batch(self.batch_size,
+                                                                                                        padded_shapes=(
+                                                                                                            [None],
+                                                                                                            [None]))
         test_dataset = tf.data.TextLineDataset(self.file_name_test).map(parse).batch(1)
 
-        iterator = tf.contrib.data.Iterator.from_structure(training_dataset.output_types,
-                                              training_dataset.output_shapes)
+        iterator = tf.data.Iterator.from_structure(training_dataset.output_types,
+                                                   training_dataset.output_shapes)
 
         self.input_batch, self.output_batch = iterator.get_next()
 
-        self.trining_init_op = iterator.make_initializer(training_dataset)
+        self.training_init_op = iterator.make_initializer(training_dataset)
         self.validation_init_op = iterator.make_initializer(validation_dataset)
         self.test_init_op = iterator.make_initializer(test_dataset)
-
 
         # Input embedding mat
         self.input_embedding_mat = tf.get_variable("input_embedding_mat",
@@ -72,7 +81,7 @@ class RNNLM(object):
         # LSTM cell
         cell = tf.contrib.rnn.LSTMCell(self.num_hidden_units, state_is_tuple=True)
         cell = tf.contrib.rnn.DropoutWrapper(cell, input_keep_prob=self.dropout_rate)
-        cell = tf.contrib.rnn.MultiRNNCell(cells=[cell]*self.num_layers, state_is_tuple=True)
+        cell = tf.contrib.rnn.MultiRNNCell(cells=[cell] * self.num_layers, state_is_tuple=True)
 
         self.cell = cell
 
@@ -95,7 +104,6 @@ class RNNLM(object):
             return real_length
 
         batch_length = get_length(non_zero_weights)
-
 
         # The shape of outputs is [batch_size, max_length, num_hidden_units]
         outputs, _ = tf.nn.dynamic_rnn(
@@ -126,7 +134,6 @@ class RNNLM(object):
         clipped_gradients, _ = tf.clip_by_global_norm(gradients, self.max_gradient_norm)
         self.updates = opt.apply_gradients(zip(clipped_gradients, params), global_step=self.global_step)
 
-
     def batch_train(self, sess, saver):
 
         best_score = np.inf
@@ -135,7 +142,7 @@ class RNNLM(object):
 
         while epoch < self.num_epochs:
 
-            sess.run(self.trining_init_op, {self.file_name_train: "./data/train.ids"})
+            sess.run(self.training_init_op, {self.file_name_train: "./data/train.ids"})
             train_loss = 0.0
             train_valid_words = 0
             while True:
@@ -148,20 +155,17 @@ class RNNLM(object):
                     train_valid_words += _valid_words
 
                     if global_step % self.check_point_step == 0:
-
                         train_loss /= train_valid_words
                         train_ppl = math.exp(train_loss)
-                        print "Training Step: {}, LR: {}".format(global_step, current_learning_rate)
-                        print "    Training PPL: {}".format(train_ppl)
+                        print("Training Step: {}, LR: {}".format(global_step, current_learning_rate))
+                        print("    Training PPL: {}".format(train_ppl))
 
                         train_loss = 0.0
                         train_valid_words = 0
 
-
                 except tf.errors.OutOfRangeError:
                     # The end of one epoch
                     break
-
 
             sess.run(self.validation_init_op, {self.file_name_validation: "./data/valid.ids"})
             dev_loss = 0.0
@@ -178,7 +182,7 @@ class RNNLM(object):
                 except tf.errors.OutOfRangeError:
                     dev_loss /= dev_valid_words
                     dev_ppl = math.exp(dev_loss)
-                    print "Validation PPL: {}".format(dev_ppl)
+                    print("Validation PPL: {}".format(dev_ppl))
                     if dev_ppl < best_score:
                         patience = 5
                         saver.save(sess, "model/best_model.ckpt")
@@ -218,9 +222,8 @@ class RNNLM(object):
                 if verbose:
                     dev_loss /= dev_valid_words
                     dev_ppl = math.exp(dev_loss)
-                    print raw_line + "    Test PPL: {}".format(dev_ppl)
+                    print(raw_line + "    Test PPL: {}".format(dev_ppl))
 
             global_dev_loss /= global_dev_valid_words
             global_dev_ppl = math.exp(global_dev_loss)
-            print "Global Test PPL: {}".format(global_dev_ppl)
-
+            print("Global Test PPL: {}".format(global_dev_ppl))
