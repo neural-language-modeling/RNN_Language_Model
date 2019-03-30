@@ -19,9 +19,9 @@ class RNNLM(object):
                  num_hidden_units,
                  max_gradient_norm,
                  initial_learning_rate=1,
-                 final_learning_rate=0.001
-                 ):
+                 final_learning_rate=0.001):
 
+        # Hyper Params Init
         self.vocab_size = vocab_size
         self.batch_size = batch_size
         self.num_epochs = num_epochs
@@ -32,6 +32,7 @@ class RNNLM(object):
         self.num_hidden_units = num_hidden_units
         self.max_gradient_norm = max_gradient_norm
 
+        # Util Variable and Ops Init.
         self.global_step = tf.Variable(0, trainable=False)
 
         # We set a dynamic learning rate, it decays every time the model has gone through 150 batches.
@@ -44,23 +45,35 @@ class RNNLM(object):
 
         self.dropout_rate = tf.placeholder(tf.float32, name="dropout_rate")
 
-        self.file_name_train = tf.placeholder(tf.string)
-        self.file_name_validation = tf.placeholder(tf.string)
-        self.file_name_test = tf.placeholder(tf.string)
+        # Filenames for Datasets.
+        self.filename_train = tf.placeholder(tf.string)
+        self.filename_validation = tf.placeholder(tf.string)
+        self.filename_test = tf.placeholder(tf.string)
 
+        # Dataset Preparation.
         def parse(line):
+            """
+            Turn a line into an (input, output) pair.
+            """
+            # The sentence is <sos> 1 2 3 <eos>
             line_split = tf.string_split([line])
+            # input is <sos> 1 2 3
             input_seq = tf.string_to_number(line_split.values[:-1], out_type=tf.int32)
+            # output is 1 2 3 <eos>
             output_seq = tf.string_to_number(line_split.values[1:], out_type=tf.int32)
             return input_seq, output_seq
 
-        training_dataset = tf.data.TextLineDataset(self.file_name_train).map(parse).shuffle(256).padded_batch(
+        # The map(parse) actually create both input and output from the text lines.
+        training_dataset = tf.data.TextLineDataset(self.filename_train).map(parse).shuffle(256).padded_batch(
             self.batch_size, padded_shapes=([None], [None]))
-        validation_dataset = tf.data.TextLineDataset(self.file_name_validation).map(parse).padded_batch(self.batch_size,
-                                                                                                        padded_shapes=(
-                                                                                                            [None],
-                                                                                                            [None]))
-        test_dataset = tf.data.TextLineDataset(self.file_name_test).map(parse).batch(1)
+
+        # padded_batch() first pad each element and then batch them.
+        # The padding is done according to padded_shapes, which should match the shape of the element.
+        # Using None in dimension means padding to the max length of that dimension.
+        validation_dataset = tf.data.TextLineDataset(self.filename_validation).map(parse).padded_batch(
+            self.batch_size, padded_shapes=([None], [None]))
+
+        test_dataset = tf.data.TextLineDataset(self.filename_test).map(parse).batch(1)
 
         iterator = tf.data.Iterator.from_structure(training_dataset.output_types,
                                                    training_dataset.output_shapes)
@@ -70,14 +83,16 @@ class RNNLM(object):
         self.training_init_op = iterator.make_initializer(training_dataset)
         self.validation_init_op = iterator.make_initializer(validation_dataset)
         self.test_init_op = iterator.make_initializer(test_dataset)
+        # End Dataset Preparation
 
-        # Input embedding mat
+        # Input Embedding Init.
         self.input_embedding_mat = tf.get_variable("input_embedding_mat",
                                                    [self.vocab_size, self.num_hidden_units],
                                                    dtype=tf.float32)
 
         self.input_embedded = tf.nn.embedding_lookup(self.input_embedding_mat, self.input_batch)
 
+        # RNN Network Init
         # LSTM cell
         cell = tf.contrib.rnn.LSTMCell(self.num_hidden_units, state_is_tuple=True)
         cell = tf.contrib.rnn.DropoutWrapper(cell, input_keep_prob=self.dropout_rate)
@@ -85,7 +100,7 @@ class RNNLM(object):
 
         self.cell = cell
 
-        # Output embedding
+        # Output Embeddings Init
         self.output_embedding_mat = tf.get_variable("output_embedding_mat",
                                                     [self.vocab_size, self.num_hidden_units],
                                                     dtype=tf.float32)
@@ -94,55 +109,74 @@ class RNNLM(object):
                                                      [self.vocab_size],
                                                      dtype=tf.float32)
 
+        # 0 => 0; non-zero => 1. shape is [B, M]
         non_zero_weights = tf.sign(self.input_batch)
+        # all dimensions are reduced. valid_words is a scalar.
+        # count the non-zero elements in [B, M].
         self.valid_words = tf.reduce_sum(non_zero_weights)
 
         # Compute sequence length
         def get_length(non_zero_place):
+            # shape change: [B, M] => [B].
+            # count the valid words in each sentence.
             real_length = tf.reduce_sum(non_zero_place, 1)
             real_length = tf.cast(real_length, tf.int32)
             return real_length
 
-        batch_length = get_length(non_zero_weights)
+        real_length_in_batch = get_length(non_zero_weights)
 
         # The shape of outputs is [batch_size, max_length, num_hidden_units]
         outputs, _ = tf.nn.dynamic_rnn(
             cell=self.cell,
             inputs=self.input_embedded,
-            sequence_length=batch_length,
+            sequence_length=real_length_in_batch,
             dtype=tf.float32
         )
 
         def output_embedding(current_output):
-            return tf.add(
-                tf.matmul(current_output, tf.transpose(self.output_embedding_mat)), self.output_embedding_bias)
+            return tf.add(tf.matmul(
+                current_output,
+                tf.transpose(self.output_embedding_mat)
+            ), self.output_embedding_bias)
 
         # To compute the logits
+        # outputs shape: [B, M, H]
+        # logits shape: [B, M, V]
         logits = tf.map_fn(output_embedding, outputs)
-        logits = tf.reshape(logits, [-1, vocab_size])
-        loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=tf.reshape(self.output_batch, [-1]), logits=logits) \
-               * tf.cast(tf.reshape(non_zero_weights, [-1]), tf.float32)
 
-        self.loss = loss
+        # Flatten the logits from [B,M,V] to [B*M,V]
+        logits = tf.reshape(logits, [-1, vocab_size])
+
+        loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            # Flatten the labels from [B,M] to [B*M]
+            labels=tf.reshape(self.output_batch, [-1]),
+            logits=logits,
+        )
+        # The shape of loss is [B*M].
+
+        # zero out the loss of the padding words.
+        self.loss = loss * tf.cast(
+            # Flatten non_zero_weights from [B, M] to [B*M] to match the shape of loss.
+            tf.reshape(non_zero_weights, [-1]),
+            tf.float32,
+        )
 
         # Train
-
         params = tf.trainable_variables()
 
         opt = tf.train.AdagradOptimizer(self.learning_rate)
         gradients = tf.gradients(self.loss, params, colocate_gradients_with_ops=True)
         clipped_gradients, _ = tf.clip_by_global_norm(gradients, self.max_gradient_norm)
+        # This is the Training Ops.
         self.updates = opt.apply_gradients(zip(clipped_gradients, params), global_step=self.global_step)
 
     def batch_train(self, sess, saver):
-
         best_score = np.inf
         patience = 5
         epoch = 0
 
         while epoch < self.num_epochs:
-
-            sess.run(self.training_init_op, {self.file_name_train: "./data/train.ids"})
+            sess.run(self.training_init_op, {self.filename_train: "./data/train.ids"})
             train_loss = 0.0
             train_valid_words = 0
             while True:
@@ -167,7 +201,7 @@ class RNNLM(object):
                     # The end of one epoch
                     break
 
-            sess.run(self.validation_init_op, {self.file_name_validation: "./data/valid.ids"})
+            sess.run(self.validation_init_op, {self.filename_validation: "./data/valid.ids"})
             dev_loss = 0.0
             dev_valid_words = 0
             while True:
@@ -198,7 +232,7 @@ class RNNLM(object):
     def predict(self, sess, input_file, raw_file, verbose=False):
         # if verbose is true, then we print the ppl of every sequence
 
-        sess.run(self.test_init_op, {self.file_name_test: input_file})
+        sess.run(self.test_init_op, {self.filename_test: input_file})
 
         with open(raw_file) as fp:
 
